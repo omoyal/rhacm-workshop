@@ -18,7 +18,7 @@
 1. Open your **Bastion terminal**, clone the workshop repository, and navigate to the lab scripts directory:
 
    ```bash
-   git clone [https://github.com/omoyal/rhacm-workshop.git](https://github.com/omoyal/rhacm-workshop.git)
+   git clone https://github.com/omoyal/rhacm-workshop.git
    cd rhacm-workshop/scripts/day2/01-certificate-policy
    ```
 
