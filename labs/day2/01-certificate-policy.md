@@ -142,15 +142,18 @@
 
 ### Step 7: Environment Cleanup
 
-> **Purpose:** Clean up resources to maintain an uncluttered environment for subsequent exercises.
+> **Purpose:** Safely decommission governance policies from the fleet and clean up local secrets to prepare for subsequent exercises.
 
-1. In your **Bastion terminal**, run the cleanup script:
+1. **Delete the Policy from RHACM Console first:**
+   - In the RHACM console, navigate to **Governance** ➔ **Policies**.
+   - Locate `certificate-policy-console-ingress`.
+   - Click the actions menu (`⋮`) on the right and select **Delete**.
+   - **Important:** Ensure both checkboxes are selected:
+     - ☑ **Associated PlacementBindings**
+     - ☑ **Associated Placements or PlacementRules**
+   - Click **Delete**.
 
+2. **Clean up local resources via Bastion Terminal:**
+   - Return to your terminal and run the cleanup script to remove the test namespace and leftover secrets:
    ```bash
    ./03-lab-finish.sh
-   ```
-
-2. In the RHACM Web Console:
-   - Go to **Governance** ➔ **Policies**.
-   - Click the actions icon (`⋮`) next to `certificate-policy-console-ingress` and click **Delete**.
-   - Ensure the checkboxes for **Associated PlacementBindings** and **Associated Placements or PlacementRules** are checked, then confirm deletion.
