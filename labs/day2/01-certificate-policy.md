@@ -42,11 +42,12 @@
 
 1. Log in to the **OpenShift Web Console** using **Keycloak**.
 
-2. At the top navigation bar, set the perspective switcher to **All Clusters** to open the RHACM Fleet Management view.
+2. At the top navigation bar, set the perspective switcher to **Fleet management** to open the RHACM Fleet Management view.
 
 3. In the left-hand navigation menu, select **Infrastructure** ➔ **Clusters**.
 
 4. Switch to the **Cluster sets** tab, then select the **default** cluster set.
+> 💡 **Instructor Note:** A **ClusterSet** is a logical grouping of clusters. It allows us to categorize our fleet (e.g., "production", "dev", or "europe-region"). By default, RHACM always provides one out-of-the-box ClusterSet named `default`, which we will use in this lab.
 
 5. Locate the **Details** card, find **Namespace bindings**, and click the **pencil icon** (Edit).
 
