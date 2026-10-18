@@ -1,10 +1,3 @@
-אלו סימוני מקור פנימיים (Citations) שהוזרקו אוטומטית כהפניה למסמך ה-PDF שהעלית (עמודים 13 ו-16 בחוברת התרגול `governance-3.4.pdf`).
-
-**הם ממש לא אמורים להיות בתוך קובץ ה-Markdown שאתה מעלה ל-Git!**
-
-הנה הקוד-בלוק הנקי לחלוטין מכל סימון כזה, מעוצב ומרווח, מוכן להעתקה והדבקה ישירה:
-
-```markdown
 # Lab 1: SSL/TLS Certificate Expiration Enforcement
 
 ---
@@ -160,5 +153,3 @@
    - Go to **Governance** ➔ **Policies**.
    - Click the actions icon (`⋮`) next to `certificate-policy-console-ingress` and click **Delete**.
    - Ensure the checkboxes for **Associated PlacementBindings** and **Associated Placements or PlacementRules** are checked, then confirm deletion.
-
-```
