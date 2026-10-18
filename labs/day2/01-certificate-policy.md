@@ -40,7 +40,7 @@
 
 > **Purpose:** Policies run inside Kubernetes namespaces on the Hub cluster. Before a policy can distribute definitions to managed clusters, its namespace must be granted explicit permission to target cluster sets via a `ManagedClusterSetBinding`.
 
-1. Log in to the **OpenShift Web Console** using **Red Hat Identity Management / Keycloak**.
+1. Log in to the **OpenShift Web Console** using **Keycloak**.
 
 2. At the top navigation bar, set the perspective switcher to **All Clusters** to open the RHACM Fleet Management view.
 
