@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Lab 3 - Integrate Gatekeeper with RHACM            | 03-lab-finish.sh
+#  Lab 3 - Integrate Gatekeeper with RHACM            | 02-check.sh
 # -----------------------------------------------------------------------------
-#  Removes every trace of the lab (equivalent of "lab finish"):
-#   Hub     : lab policies, placements, bindings, the policy-gatekeeper namespace
-#   Clusters: app namespaces, constraints, Gatekeeper instance + operator + CRDs
-#   Labels  : environment labels restored to their values before the lab
-#   Bastion : ~/lab-work/03-gatekeeper
-#  Safe to run more than once.
+#  Grades the lab (score out of 100). Read-only: changes nothing on any
+#  cluster. The enforcement test is a server-side dry run, so nothing is saved.
 # =============================================================================
 set -uo pipefail
 
@@ -15,14 +11,11 @@ LAB_ID="03-gatekeeper"
 WORK_DIR="${HOME}/lab-work/${LAB_ID}"
 STATE_FILE="${WORK_DIR}/.lab-state"
 POLICY_NS="policy-gatekeeper"
-LAB_LABEL_KEY="workshop.rhacm.io/lab"
-LAB_LABEL_VALUE="gatekeeper"
-OPERATOR_PACKAGE="gatekeeper-operator-product"
+APP_IMAGE="${APP_IMAGE:-quay.io/redhattraining/hello-world-nginx}"
+PASS_SCORE=80
 
 # ---------------------------------------------------------------- helpers ---
 die()  { echo "❌ [ERROR] $*" >&2; exit 1; }
-info() { echo "   • $*"; }
-warn() { echo "   ⚠️  $*"; }
 hub()  { oc --request-timeout=30s "$@"; }
 ocx()  { local role="$1"; shift; oc --request-timeout=30s --kubeconfig "${KUBE_DIR}/${role}.kubeconfig" "$@"; }
 
@@ -35,11 +28,9 @@ require_hub() {
 
 load_state() {
   local env_stage="${STAGE_CLUSTER:-}" env_prod="${PROD_CLUSTER:-}"
-  STATE_LOADED=0
   if [[ -f "$STATE_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$STATE_FILE"
-    STATE_LOADED=1
   fi
   [[ -n "$env_stage" ]] && STAGE_CLUSTER="$env_stage"
   [[ -n "$env_prod" ]] && PROD_CLUSTER="$env_prod"
@@ -73,153 +64,188 @@ fetch_kubeconfig() {   # $1 = managed cluster name, $2 = destination file
     || { echo "❌ The API of '$cluster' is not reachable from this bastion." >&2; return 1; }
 }
 
-wait_until_gone() {   # $1 seconds  $2.. command that succeeds while the object still exists
-  local timeout="$1" waited=0
-  shift
-  while "$@" >/dev/null 2>&1; do
-    (( waited >= timeout )) && return 1
-    sleep 5
-    waited=$((waited + 5))
-  done
-  return 0
+# Placement name bound to a policy (via its PlacementBinding)
+placement_of() {
+  hub get placementbindings.policy.open-cluster-management.io -n "$POLICY_NS" \
+      -o jsonpath='{range .items[*]}{.placementRef.name}{" "}{.subjects[*].name}{"\n"}{end}' 2>/dev/null \
+    | awk -v p="$1" '{for (i = 2; i <= NF; i++) if ($i == p) {print $1; exit}}'
 }
 
-# Root policies on the hub (any namespace) that install the Gatekeeper operator
-gatekeeper_policies() {
-  local p
-  for p in $(hub get policies.policy.open-cluster-management.io -A -l '!policy.open-cluster-management.io/root-policy' \
-      -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
-    hub get policies.policy.open-cluster-management.io "${p#*/}" -n "${p%%/*}" -o yaml 2>/dev/null \
-      | grep "$OPERATOR_PACKAGE" >/dev/null && echo "$p"
-  done
+# Sorted, space-separated list of clusters a Placement selected
+decisions_of() {
+  hub get placementdecisions.cluster.open-cluster-management.io -n "$POLICY_NS" \
+      -l "cluster.open-cluster-management.io/placement=$1" \
+      -o jsonpath='{.items[*].status.decisions[*].clusterName}' 2>/dev/null | tr ' ' '\n' | grep -v '^$' | sort -u | xargs
 }
 
-restore_label() {   # $1 cluster  $2 previous value ("" = had no label)
-  hub get managedcluster "$1" >/dev/null 2>&1 || return 0
-  if [[ -n "$2" ]]; then
-    hub label managedcluster "$1" "environment=$2" --overwrite >/dev/null
+ready_replicas() {   # $1 role  $2 namespace  $3 deployment
+  local n
+  n="$(ocx "$1" get deployment "$3" -n "$2" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)"
+  echo "${n:-0}"
+}
+
+# ---------------------------------------------------------------- scoring ---
+SCORE=0
+TOTAL=0
+check() {   # $1 weight  $2 description  $3 hint  $4.. command
+  local weight="$1" desc="$2" hint="$3"
+  shift 3
+  TOTAL=$((TOTAL + weight))
+  if "$@" >/dev/null 2>&1; then
+    SCORE=$((SCORE + weight))
+    printf '  ✅ %3d/%-3d %s\n' "$weight" "$weight" "$desc"
   else
-    hub label managedcluster "$1" environment- >/dev/null 2>&1
+    printf '  ❌ %3d/%-3d %s\n' 0 "$weight" "$desc"
+    printf '              👉 %s\n' "$hint"
   fi
 }
 
-cleanup_cluster() {   # $1 role (stage|production)  $2 cluster name
-  local role="$1" name="$2" ns owner sub csv crd
+# ------------------------------------------------------------------ tests ---
+t_namespace() { hub get namespace "$POLICY_NS"; }
 
-  # Lab application namespaces (only if this lab created them)
-  for ns in app-stage app-test app-prod; do
-    ocx "$role" get namespace "$ns" >/dev/null 2>&1 || continue
-    owner="$(ocx "$role" get namespace "$ns" -o jsonpath="{.metadata.labels.workshop\.rhacm\.io/lab}" 2>/dev/null)"
-    if [[ "$owner" == "$LAB_LABEL_VALUE" ]]; then
-      ocx "$role" delete namespace "$ns" --wait=false >/dev/null 2>&1
-    else
-      warn "${name}: namespace '$ns' was not created by this lab (no ${LAB_LABEL_KEY}=${LAB_LABEL_VALUE} label), left untouched"
-    fi
+t_binding() {
+  [[ "$(hub get managedclustersetbindings.cluster.open-cluster-management.io default -n "$POLICY_NS" \
+        -o jsonpath='{.spec.clusterSet}' 2>/dev/null)" == "default" ]]
+}
+
+t_operator_policy() {
+  local yaml
+  yaml="$(hub get policies.policy.open-cluster-management.io policy-gatekeeper-operator -n "$POLICY_NS" -o yaml 2>/dev/null)" || return 1
+  grep -Eq '^  remediationAction: enforce' <<<"$yaml" && grep -q 'kind: OperatorPolicy' <<<"$yaml"
+}
+
+t_operator_placement() {
+  local p
+  p="$(placement_of policy-gatekeeper-operator)"
+  [[ -n "$p" && "$(decisions_of "$p")" == "$EXPECTED_CLUSTERS" ]]
+}
+
+t_operator_ready() {   # $1 role
+  ocx "$1" get csv -n openshift-operators \
+      -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}' 2>/dev/null \
+    | grep -E '^gatekeeper-operator-product\.[^ ]+ Succeeded$' >/dev/null || return 1
+  [[ "$(ready_replicas "$1" openshift-gatekeeper-system gatekeeper-controller-manager)" -ge 1 ]]
+}
+
+t_exclusion() {
+  hub get policies.policy.open-cluster-management.io policy-gatekeeper-operator -n "$POLICY_NS" -o yaml 2>/dev/null \
+    | grep -A4 'excludedNamespaces:' | grep 'app-stage' >/dev/null || return 1
+  ocx stage get configs.config.gatekeeper.sh config -n openshift-gatekeeper-system \
+      -o jsonpath='{.spec.match[*].excludedNamespaces[*]}' 2>/dev/null | tr ' ' '\n' | grep -x 'app-stage' >/dev/null
+}
+
+t_latest_placement() {
+  local p
+  p="$(placement_of policy-gatekeeper-containerimage-latest)"
+  [[ -n "$p" && "$(decisions_of "$p")" == "$EXPECTED_CLUSTERS" ]]
+}
+
+t_constraint() {   # $1 role
+  ocx "$1" get constrainttemplates.templates.gatekeeper.sh containerimagelatest && \
+  ocx "$1" get containerimagelatest.constraints.gatekeeper.sh containerimagelatest
+}
+
+t_stage_hello() {
+  local img
+  img="$(ocx stage get deployment stage-hello -n app-stage -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
+  [[ "$img" == *:latest && "$(ready_replicas stage app-stage stage-hello)" -ge 1 ]]
+}
+
+t_prod_hello() {
+  local img
+  img="$(ocx production get deployment prod-hello -n app-prod -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
+  [[ -n "$img" && "$img" != *:latest && "$(ready_replicas production app-prod prod-hello)" -ge 1 ]]
+}
+
+t_enforcement() {   # a ':latest' Deployment must be denied on both clusters (dry run)
+  local role out
+  for role in stage production; do
+    out="$(ocx "$role" create --dry-run=server -o name -f - 2>&1 <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab-grader-probe
+  namespace: default
+spec:
+  selector:
+    matchLabels: {app: lab-grader-probe}
+  template:
+    metadata:
+      labels: {app: lab-grader-probe}
+    spec:
+      containers:
+        - name: probe
+          image: ${APP_IMAGE}:latest
+EOF
+)" && return 1
+    grep -q 'containerimagelatest' <<<"$out" || return 1
   done
-
-  # Lab constraint (normally removed by RHACM together with the policy)
-  ocx "$role" delete containerimagelatest.constraints.gatekeeper.sh containerimagelatest --ignore-not-found >/dev/null 2>&1
-  ocx "$role" delete constrainttemplates.templates.gatekeeper.sh containerimagelatest --ignore-not-found >/dev/null 2>&1
-
-  # Gatekeeper instance -> the operator removes its webhooks and pods
-  if ocx "$role" get crd gatekeepers.operator.gatekeeper.sh >/dev/null 2>&1; then
-    ocx "$role" delete gatekeepers.operator.gatekeeper.sh --all --wait=false >/dev/null 2>&1
-    wait_until_gone 180 ocx "$role" get validatingwebhookconfiguration gatekeeper-validating-webhook-configuration \
-      || warn "${name}: Gatekeeper webhook still present after 3 minutes, removing it directly"
-  fi
-  ocx "$role" delete validatingwebhookconfiguration gatekeeper-validating-webhook-configuration --ignore-not-found >/dev/null 2>&1
-  ocx "$role" delete mutatingwebhookconfiguration gatekeeper-mutating-webhook-configuration --ignore-not-found >/dev/null 2>&1
-
-  # Operator: Subscription + CSV
-  for sub in $(ocx "$role" get subscriptions.operators.coreos.com -n openshift-operators \
-      -o jsonpath="{range .items[?(@.spec.name==\"${OPERATOR_PACKAGE}\")]}{.metadata.name}{\"\\n\"}{end}" 2>/dev/null); do
-    ocx "$role" delete subscriptions.operators.coreos.com "$sub" -n openshift-operators >/dev/null 2>&1
-  done
-  for csv in $(ocx "$role" get csv -n openshift-operators -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
-    [[ "$csv" == "${OPERATOR_PACKAGE}."* ]] && ocx "$role" delete csv "$csv" -n openshift-operators >/dev/null 2>&1
-  done
-
-  # Gatekeeper namespace and CRDs
-  ocx "$role" delete namespace openshift-gatekeeper-system --ignore-not-found --wait=false >/dev/null 2>&1
-  for crd in $(ocx "$role" get crd -o name 2>/dev/null | grep -E '\.gatekeeper\.sh$'); do
-    ocx "$role" delete "$crd" --wait=false >/dev/null 2>&1
-  done
-
-  info "${name}: app namespaces, constraint and Gatekeeper removed"
 }
 
 # ------------------------------------------------------------------- main ---
-echo "🧹 [LAB FINISH] Cleaning up the Gatekeeper Lab..."
+echo "🔎 [LAB CHECK] Grading the Gatekeeper Lab..."
 echo ""
 
 require_hub
 load_state
-CLUSTERS_OK=1
-discover_clusters || CLUSTERS_OK=0
+discover_clusters || exit 1
+EXPECTED_CLUSTERS="$(printf '%s\n' "$STAGE_CLUSTER" "$PROD_CLUSTER" | sort | xargs)"
 
-# --- 1. Hub: policies first, so RHACM stops re-creating objects --------------
-if hub get namespace "$POLICY_NS" >/dev/null 2>&1; then
-  hub delete policies.policy.open-cluster-management.io --all -n "$POLICY_NS" --ignore-not-found >/dev/null 2>&1
-  hub delete placementbindings.policy.open-cluster-management.io --all -n "$POLICY_NS" --ignore-not-found >/dev/null 2>&1
-  hub delete placements.cluster.open-cluster-management.io --all -n "$POLICY_NS" --ignore-not-found >/dev/null 2>&1
-  info "Hub: lab policies, placements and bindings deleted"
-fi
-other_policies="$(gatekeeper_policies)"
-if [[ -n "$other_policies" ]]; then
-  warn "These RHACM policies (not part of this lab) also install Gatekeeper and will re-install it:"
-  sed 's/^/        - /' <<<"$other_policies"
-  warn "Delete them first if you want Gatekeeper fully removed, then run this script again."
-fi
+KUBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gk-check.XXXXXX")"
+trap 'rm -rf -- "$KUBE_DIR"' EXIT
+fetch_kubeconfig "$STAGE_CLUSTER" "$KUBE_DIR/stage.kubeconfig" || echo "   (stage checks will fail)"
+fetch_kubeconfig "$PROD_CLUSTER" "$KUBE_DIR/production.kubeconfig" || echo "   (production checks will fail)"
 
-# --- 2. Managed clusters -------------------------------------------------------
-if [[ "$CLUSTERS_OK" -eq 1 ]]; then
-  KUBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gk-finish.XXXXXX")"
-  trap 'rm -rf -- "$KUBE_DIR"' EXIT
+echo "   🟡 Stage: ${STAGE_CLUSTER}    🔴 Production: ${PROD_CLUSTER}"
+echo ""
 
-  # Wait until RHACM has withdrawn the replicated policies from both clusters
-  for c in "$STAGE_CLUSTER" "$PROD_CLUSTER"; do
-    wait_until_gone 120 bash -c "oc --request-timeout=30s get policies.policy.open-cluster-management.io -n '$c' -o name 2>/dev/null | grep '/${POLICY_NS}\.' >/dev/null" \
-      || warn "${c}: replicated lab policies still present after 2 minutes, continuing anyway"
-  done
-
-  for pair in "stage:${STAGE_CLUSTER}" "production:${PROD_CLUSTER}"; do
-    role="${pair%%:*}"; name="${pair#*:}"
-    if fetch_kubeconfig "$name" "$KUBE_DIR/${role}.kubeconfig"; then
-      cleanup_cluster "$role" "$name"
-    else
-      warn "${name}: cannot reach the cluster, its cleanup was skipped. Run this script again later."
-    fi
-  done
-
-  # --- 3. Restore the environment labels -------------------------------------
-  if [[ "$STATE_LOADED" -eq 1 ]]; then
-    restore_label "$STAGE_CLUSTER" "${PREV_ENV_STAGE:-}"
-    restore_label "$PROD_CLUSTER" "${PREV_ENV_PROD:-}"
-    [[ -n "${PREV_ENV_HUB:-}" ]] && restore_label local-cluster "$PREV_ENV_HUB"
-  else
-    # No saved state: remove only the labels this lab sets
-    [[ "$(hub get managedcluster "$STAGE_CLUSTER" -o jsonpath='{.metadata.labels.environment}' 2>/dev/null)" == "stage" ]] \
-      && restore_label "$STAGE_CLUSTER" ""
-    [[ "$(hub get managedcluster "$PROD_CLUSTER" -o jsonpath='{.metadata.labels.environment}' 2>/dev/null)" == "production" ]] \
-      && restore_label "$PROD_CLUSTER" ""
-  fi
-  info "Hub: environment labels restored"
-else
-  warn "Managed clusters could not be identified - only the hub was cleaned."
-fi
-
-# --- 4. Hub namespace (also removes the ManagedClusterSetBinding) -------------
-if hub get namespace "$POLICY_NS" >/dev/null 2>&1; then
-  [[ "$(hub project -q 2>/dev/null)" == "$POLICY_NS" ]] && hub project default >/dev/null 2>&1
-  hub delete namespace "$POLICY_NS" --wait=false >/dev/null 2>&1
-  info "Hub: namespace '${POLICY_NS}' deleted"
-fi
-
-# --- 5. Local lab files ------------------------------------------------------------
-if [[ -d "$WORK_DIR" && "$WORK_DIR" == "${HOME}/lab-work/${LAB_ID}" ]]; then
-  rm -rf -- "$WORK_DIR"
-  info "Bastion: ${WORK_DIR} removed"
-fi
+check 5  "Namespace '${POLICY_NS}' exists on the hub" \
+         "Step 2: oc new-project ${POLICY_NS}" \
+         t_namespace
+check 10 "Cluster set 'default' is bound to '${POLICY_NS}'" \
+         "Step 4: Cluster sets > default > Namespace bindings > add ${POLICY_NS}" \
+         t_binding
+check 10 "Policy 'policy-gatekeeper-operator' (OperatorPolicy, Enforce) exists" \
+         "Step 5: name/namespace must match exactly and Remediation must be 'Enforce'" \
+         t_operator_policy
+check 10 "Operator policy targets exactly the 2 managed clusters (not the hub)" \
+         "Step 5: add the label expression environment = stage, production to the placement" \
+         t_operator_placement
+check 5  "Gatekeeper is installed and running on ${STAGE_CLUSTER} (stage)" \
+         "Step 6: wait a few minutes, then check Governance > policy-gatekeeper-operator > Results" \
+         t_operator_ready stage
+check 5  "Gatekeeper is installed and running on ${PROD_CLUSTER} (production)" \
+         "Step 6: wait a few minutes, then check Governance > policy-gatekeeper-operator > Results" \
+         t_operator_ready production
+check 10 "Namespace 'app-stage' is excluded from all constraints (through the policy)" \
+         "Step 7: add the 'config:' block to the Gatekeeper object inside the policy with 'oc edit policy'" \
+         t_exclusion
+check 10 "Policy 'policy-gatekeeper-containerimage-latest' targets stage + production" \
+         "Step 8: replace both CHANGE_ME values in policy-latest.yaml and run 'oc apply' again" \
+         t_latest_placement
+check 5  "Constraint 'containerimagelatest' is deployed on ${STAGE_CLUSTER}" \
+         "Step 8: check the policy Results tab for errors" \
+         t_constraint stage
+check 5  "Constraint 'containerimagelatest' is deployed on ${PROD_CLUSTER}" \
+         "Step 8: check the policy Results tab for errors" \
+         t_constraint production
+check 10 "stage-hello runs with ':latest' in the excluded 'app-stage' namespace" \
+         "Step 9: oc-stage create -f stage-hello.yaml   (the exclusion from Step 7 must be in place first)" \
+         t_stage_hello
+check 10 "prod-hello runs in 'app-prod' with a pinned (non-latest) image tag" \
+         "Step 10: change the image tag to v1.0 in prod-hello.yaml, delete the leftovers and create it again" \
+         t_prod_hello
+check 5  "Gatekeeper denies ':latest' on both clusters (live dry-run test)" \
+         "Steps 6-8: Gatekeeper and the constraint must be active on both clusters" \
+         t_enforcement
 
 echo ""
-echo "✅ Environment is clean for the next lab!"
+echo "──────────────────────────────────────────────────────────────"
+if [[ "$SCORE" -eq "$TOTAL" ]]; then
+  echo "🏆 Score: ${SCORE}/${TOTAL}  -  Perfect! Gatekeeper is enforced across your fleet."
+elif [[ "$SCORE" -ge "$PASS_SCORE" ]]; then
+  echo "✅ Score: ${SCORE}/${TOTAL}  -  PASSED. Fix the ❌ items above for a perfect score."
+else
+  echo "❌ Score: ${SCORE}/${TOTAL}  -  NOT YET (${PASS_SCORE} needed). Follow the 👉 hints and run the check again."
+fi
+echo "──────────────────────────────────────────────────────────────"
