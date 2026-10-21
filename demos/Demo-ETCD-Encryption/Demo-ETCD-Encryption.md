@@ -39,6 +39,13 @@
 - The policy sets `spec.encryption.type: aescbc` on the `APIServer` resource. OpenShift does the rest.
 - Encryption takes **10 to 20 minutes** or more, and the API servers roll out during that time. Do not apply it right before a demo of something else on the same cluster.
 - Turning encryption off again is also a full re-write of the data. Treat it as a permanent setting.
+- if you want to see the progress see in Cluster 1:
+
+```bash
+oc get co kube-apiserver openshift-apiserver authentication
+oc get openshiftapiserver -o=jsonpath='{range .items[0].status.conditions[?(@.type=="Encrypted")]}{.reason}{"\n"}{.message}{"\n"}{end}'
+oc get kubeapiserver -o=jsonpath='{range .items[0].status.conditions[?(@.type=="Encrypted")]}{.reason}{"\n"}{.message}{"\n"}{end}'
+```
 
 ### Cleanup
 
