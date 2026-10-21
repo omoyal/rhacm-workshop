@@ -1,121 +1,209 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# =============================================================================
+#  Lab 3 - Integrate Gatekeeper with RHACM            | 03-lab-finish.sh
+# -----------------------------------------------------------------------------
+#  Removes every trace of the lab (equivalent of "lab finish"):
+#   Hub     : lab policies, placements, bindings, the policy-gatekeeper namespace
+#   Clusters: app namespaces, constraints, Gatekeeper instance + operator + CRDs
+#   Labels  : environment labels restored to their values before the lab
+#   Bastion : ~/lab-work/03-gatekeeper
+#  Safe to run more than once.
+# =============================================================================
+set -uo pipefail
 
-LAB_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/rhacm-gatekeeper-lab"
-STAGE_CLUSTER="cluster2-sno"
-PROD_CLUSTER="cluster1"
-OWNER_LABEL="workshop.rhacm.io/owner"
-OWNER_VALUE="gatekeeper-lab"
-die() { echo "ERROR: $*" >&2; exit 1; }
-# Use the active hub login. Never modify the user's kubeconfig.
-set +x
-command -v oc >/dev/null || { echo "ERROR: oc is required." >&2; exit 1; }
-command -v python3 >/dev/null || { echo "ERROR: python3 is required." >&2; exit 1; }
-HUB_CONTEXT=hub
-STAGE_CONTEXT=stage
-PROD_CONTEXT=production
-HUB_LOGIN="$(oc config current-context)" || exit 1
-oc --context "$HUB_LOGIN" get managedcluster cluster1 cluster2-sno -o name >/dev/null || {
-  echo "ERROR: Run from the workshop terminal logged in to your ACM hub, with access to cluster1 and cluster2-sno." >&2
-  exit 1
+LAB_ID="03-gatekeeper"
+WORK_DIR="${HOME}/lab-work/${LAB_ID}"
+STATE_FILE="${WORK_DIR}/.lab-state"
+POLICY_NS="policy-gatekeeper"
+LAB_LABEL_KEY="workshop.rhacm.io/lab"
+LAB_LABEL_VALUE="gatekeeper"
+OPERATOR_PACKAGE="gatekeeper-operator-product"
+
+# ---------------------------------------------------------------- helpers ---
+die()  { echo "❌ [ERROR] $*" >&2; exit 1; }
+info() { echo "   • $*"; }
+warn() { echo "   ⚠️  $*"; }
+hub()  { oc --request-timeout=30s "$@"; }
+ocx()  { local role="$1"; shift; oc --request-timeout=30s --kubeconfig "${KUBE_DIR}/${role}.kubeconfig" "$@"; }
+
+require_hub() {
+  command -v oc >/dev/null 2>&1 || die "The 'oc' CLI was not found on this machine."
+  hub whoami >/dev/null 2>&1 || die "You are not logged in. Log in to your ACM hub with 'oc login' and run again."
+  hub get crd managedclusters.cluster.open-cluster-management.io >/dev/null 2>&1 \
+    || die "Your current 'oc' session is not the ACM hub. Run 'unset KUBECONFIG' (or log in to the hub) and run again."
 }
-ACCESS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rhacm-gk-access.XXXXXXXX")"
-chmod 700 "$ACCESS_DIR"
-trap 'rm -rf -- "$ACCESS_DIR"' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-ocx() {
-  local role="$1"; shift
-  case "$role" in
-    hub) oc --context "$HUB_LOGIN" "$@" ;;
-    stage|production) oc --kubeconfig "$ACCESS_DIR/$role" "$@" ;;
-    *) echo "ERROR: Unknown cluster role: $role" >&2; return 1 ;;
-  esac
+
+load_state() {
+  local env_stage="${STAGE_CLUSTER:-}" env_prod="${PROD_CLUSTER:-}"
+  STATE_LOADED=0
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+    STATE_LOADED=1
+  fi
+  [[ -n "$env_stage" ]] && STAGE_CLUSTER="$env_stage"
+  [[ -n "$env_prod" ]] && PROD_CLUSTER="$env_prod"
+  return 0
 }
-resolve_access() {
-  local cluster="$1" role="$2" ref actual expected
-  ocx hub get clusterdeployments.hive.openshift.io -n "$cluster" -o json > "$ACCESS_DIR/deployments.json" || return 1
-  ref="$(python3 - "$ACCESS_DIR/deployments.json" "$cluster" <<'PYREF'
-import json,sys
-items=json.load(open(sys.argv[1]))['items']
-matched=[x for x in items if x['metadata']['name']==sys.argv[2] or x.get('spec',{}).get('clusterName')==sys.argv[2]]
-if not matched and len(items)==1: matched=items
-if len(matched)!=1: raise SystemExit('ERROR: Cannot uniquely identify the ClusterDeployment in '+sys.argv[2])
-m=matched[0].get('spec',{}).get('clusterMetadata') or {}
-ref=m.get('adminKubeconfigSecretRef',{}).get('name')
-if not ref: raise SystemExit('ERROR: ClusterDeployment has no adminKubeconfigSecretRef. Provisioning may be incomplete.')
-print(ref)
-PYREF
-)" || return 1
-  # Read only the Secret explicitly referenced by the target ClusterDeployment.
-  (umask 077
-   ocx hub get secret "$ref" -n "$cluster" -o jsonpath='{.data.kubeconfig}' |
-     python3 -c 'import base64,sys; data=sys.stdin.buffer.read().strip(); data or sys.exit("ERROR: Missing kubeconfig data"); sys.stdout.buffer.write(base64.b64decode(data,validate=True))' > "$ACCESS_DIR/$role"
-  ) || return 1
-  actual="$(ocx "$role" get clusterversion version -o jsonpath='{.spec.clusterID}')" || return 1
-  expected="$(python3 - "$ACCESS_DIR/deployments.json" "$ref" <<'PYID'
-import json,sys
-for x in json.load(open(sys.argv[1]))['items']:
- m=x.get('spec',{}).get('clusterMetadata') or {}
- if m.get('adminKubeconfigSecretRef',{}).get('name')==sys.argv[2]:
-  print(m.get('clusterID','')); break
-PYID
-)"
-  if [[ -n "$expected" && "$expected" != "$actual" ]]; then
-    echo "ERROR: Kubeconfig cluster identity does not match $cluster." >&2
+
+discover_clusters() {
+  [[ -n "${STAGE_CLUSTER:-}" && -n "${PROD_CLUSTER:-}" ]] && return 0
+  local managed=()
+  mapfile -t managed < <(hub get managedclusters -l 'local-cluster!=true' \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -vx 'local-cluster' | grep -v '^$' | sort)
+  if [[ ${#managed[@]} -ne 2 ]]; then
+    echo "❌ Expected exactly 2 managed clusters (besides local-cluster), found ${#managed[@]}: ${managed[*]:-none}" >&2
+    echo "   Run again with:  STAGE_CLUSTER=<name> PROD_CLUSTER=<name> $0" >&2
     return 1
   fi
+  STAGE_CLUSTER="${managed[0]}"
+  PROD_CLUSTER="${managed[1]}"
 }
-resolve_access cluster2-sno stage || { echo "ERROR: Cannot obtain stage access through its ClusterDeployment. Check hub permissions and provisioning status." >&2; exit 1; }
-resolve_access cluster1 production || { echo "ERROR: Cannot obtain production access through its ClusterDeployment. Check hub permissions and provisioning status." >&2; exit 1; }
 
-ocx "$HUB_CONTEXT" get policy ws-gatekeeper-install -n ws-gatekeeper-lab >/dev/null 2>&1 || die "The RHACM installation policy ws-gatekeeper-install is missing. Nothing was cleaned up."
+fetch_kubeconfig() {   # $1 = managed cluster name, $2 = destination file
+  local cluster="$1" dest="$2" cd secret
+  cd="$(hub get clusterdeployments.hive.openshift.io -n "$cluster" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+  [[ -n "$cd" ]] || { echo "❌ No ClusterDeployment found for '$cluster' (this lab expects clusters created by ACM)." >&2; return 1; }
+  secret="$(hub get clusterdeployments.hive.openshift.io "$cd" -n "$cluster" \
+      -o jsonpath='{.spec.clusterMetadata.adminKubeconfigSecretRef.name}' 2>/dev/null)"
+  [[ -n "$secret" ]] || { echo "❌ '$cluster' has no admin kubeconfig yet. Is it fully provisioned?" >&2; return 1; }
+  ( umask 077; hub extract "secret/${secret}" -n "$cluster" --keys=kubeconfig --to=- >"$dest" 2>/dev/null ) \
+    || { echo "❌ Cannot read the admin kubeconfig of '$cluster'." >&2; return 1; }
+  oc --request-timeout=30s --kubeconfig "$dest" get clusterversion version -o name >/dev/null 2>&1 \
+    || { echo "❌ The API of '$cluster' is not reachable from this bastion." >&2; return 1; }
+}
 
-echo "Resetting the namespace exemption while keeping the Gatekeeper installation policy..."
-ocx "$HUB_CONTEXT" apply -f "$LAB_DIR/install-gatekeeper.yaml"
-
-for pair in "$STAGE_CONTEXT:stage" "$PROD_CONTEXT:production"; do
-  ctx="${pair%%:*}"; label="${pair#*:}"
-  exclusion="$(ocx "$ctx" get gatekeeper gatekeeper -o jsonpath='{.spec.config.matches[0].excludedNamespaces[0]}' 2>/dev/null || true)"
-  if [[ "$exclusion" == "ws-stage-exempt" ]]; then
-    ocx "$ctx" patch gatekeeper gatekeeper --type=json \
-      -p='[{"op":"remove","path":"/spec/config/matches/0"}]' >/dev/null
-  elif [[ -n "$exclusion" ]]; then
-    die "$label: found an unexpected Gatekeeper namespace exclusion '$exclusion'; leaving it untouched."
-  fi
-done
-
-echo "Removing the RHACM constraint policy..."
-ocx "$HUB_CONTEXT" delete policy ws-gatekeeper-container-tags -n ws-gatekeeper-lab --ignore-not-found --wait=false >/dev/null
-
-for pair in "$STAGE_CONTEXT:stage" "$PROD_CONTEXT:production"; do
-  ctx="${pair%%:*}"; label="${pair#*:}"
-  for _ in $(seq 1 60); do
-    template="$(ocx "$ctx" get constrainttemplate wscontainertags -o name 2>/dev/null || true)"
-    constraint="$(ocx "$ctx" get wscontainertags ws-no-latest -o name 2>/dev/null || true)"
-    [[ -z "$template" && -z "$constraint" ]] && break
+wait_until_gone() {   # $1 seconds  $2.. command that succeeds while the object still exists
+  local timeout="$1" waited=0
+  shift
+  while "$@" >/dev/null 2>&1; do
+    (( waited >= timeout )) && return 1
     sleep 5
+    waited=$((waited + 5))
   done
-  [[ -z "$(ocx "$ctx" get constrainttemplate wscontainertags -o name 2>/dev/null || true)" ]] || die "$label: ConstraintTemplate remains. Check RHACM policy propagation; test namespaces were left in place."
-  [[ -z "$(ocx "$ctx" get wscontainertags ws-no-latest -o name 2>/dev/null || true)" ]] || die "$label: constraint remains. Check RHACM policy propagation; test namespaces were left in place."
-done
+  return 0
+}
 
-ocx "$HUB_CONTEXT" delete placementbinding ws-gatekeeper-container-tags -n ws-gatekeeper-lab --ignore-not-found >/dev/null
-ocx "$HUB_CONTEXT" delete placement ws-gatekeeper-container-tags -n ws-gatekeeper-lab --ignore-not-found >/dev/null
-
-delete_owned_namespace() {
-  local ctx="$1" name="$2" owner
-  if ocx "$ctx" get namespace "$name" >/dev/null 2>&1; then
-    owner="$(ocx "$ctx" get namespace "$name" -o "go-template={{index .metadata.labels \"$OWNER_LABEL\"}}")"
-    [[ "$owner" == "$OWNER_VALUE" ]] || die "Refusing to delete namespace $name: ownership label does not match."
-    ocx "$ctx" delete namespace "$name" --wait=false >/dev/null
+restore_label() {   # $1 cluster  $2 previous value ("" = had no label)
+  hub get managedcluster "$1" >/dev/null 2>&1 || return 0
+  if [[ -n "$2" ]]; then
+    hub label managedcluster "$1" "environment=$2" --overwrite >/dev/null
+  else
+    hub label managedcluster "$1" environment- >/dev/null 2>&1
   fi
 }
 
-delete_owned_namespace "$STAGE_CONTEXT" ws-stage
-delete_owned_namespace "$STAGE_CONTEXT" ws-stage-exempt
-delete_owned_namespace "$PROD_CONTEXT" ws-prod
+cleanup_cluster() {   # $1 role (stage|production)  $2 cluster name
+  local role="$1" name="$2" ns owner sub csv crd
 
-echo "✅ Exercise constraints and test namespaces removed. Gatekeeper remains installed and managed by ws-gatekeeper-install."
-echo "ℹ️ The ws-gatekeeper-lab namespace, its default ManagedClusterSetBinding, and target labels are retained so RHACM keeps Gatekeeper managed on both clusters."
-echo "ℹ️ Generated local files remain under $LAB_DIR and contain policies only, not credentials."
+  # Lab application namespaces (only if this lab created them)
+  for ns in app-stage app-test app-prod; do
+    ocx "$role" get namespace "$ns" >/dev/null 2>&1 || continue
+    owner="$(ocx "$role" get namespace "$ns" -o jsonpath="{.metadata.labels.workshop\.rhacm\.io/lab}" 2>/dev/null)"
+    if [[ "$owner" == "$LAB_LABEL_VALUE" ]]; then
+      ocx "$role" delete namespace "$ns" --wait=false >/dev/null 2>&1
+    else
+      warn "${name}: namespace '$ns' was not created by this lab (no ${LAB_LABEL_KEY}=${LAB_LABEL_VALUE} label), left untouched"
+    fi
+  done
+
+  # Lab constraint (normally removed by RHACM together with the policy)
+  ocx "$role" delete containerimagelatest.constraints.gatekeeper.sh containerimagelatest --ignore-not-found >/dev/null 2>&1
+  ocx "$role" delete constrainttemplates.templates.gatekeeper.sh containerimagelatest --ignore-not-found >/dev/null 2>&1
+
+  # Gatekeeper instance -> the operator removes its webhooks and pods
+  if ocx "$role" get crd gatekeepers.operator.gatekeeper.sh >/dev/null 2>&1; then
+    ocx "$role" delete gatekeepers.operator.gatekeeper.sh --all --wait=false >/dev/null 2>&1
+    wait_until_gone 180 ocx "$role" get validatingwebhookconfiguration gatekeeper-validating-webhook-configuration \
+      || warn "${name}: Gatekeeper webhook still present after 3 minutes, removing it directly"
+  fi
+  ocx "$role" delete validatingwebhookconfiguration gatekeeper-validating-webhook-configuration --ignore-not-found >/dev/null 2>&1
+  ocx "$role" delete mutatingwebhookconfiguration gatekeeper-mutating-webhook-configuration --ignore-not-found >/dev/null 2>&1
+
+  # Operator: Subscription + CSV
+  for sub in $(ocx "$role" get subscriptions.operators.coreos.com -n openshift-operators \
+      -o jsonpath="{range .items[?(@.spec.name==\"${OPERATOR_PACKAGE}\")]}{.metadata.name}{\"\\n\"}{end}" 2>/dev/null); do
+    ocx "$role" delete subscriptions.operators.coreos.com "$sub" -n openshift-operators >/dev/null 2>&1
+  done
+  for csv in $(ocx "$role" get csv -n openshift-operators -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+    [[ "$csv" == "${OPERATOR_PACKAGE}."* ]] && ocx "$role" delete csv "$csv" -n openshift-operators >/dev/null 2>&1
+  done
+
+  # Gatekeeper namespace and CRDs
+  ocx "$role" delete namespace openshift-gatekeeper-system --ignore-not-found --wait=false >/dev/null 2>&1
+  for crd in $(ocx "$role" get crd -o name 2>/dev/null | grep -E '\.gatekeeper\.sh$'); do
+    ocx "$role" delete "$crd" --wait=false >/dev/null 2>&1
+  done
+
+  info "${name}: app namespaces, constraint and Gatekeeper removed"
+}
+
+# ------------------------------------------------------------------- main ---
+echo "🧹 [LAB FINISH] Cleaning up the Gatekeeper Lab..."
+echo ""
+
+require_hub
+load_state
+CLUSTERS_OK=1
+discover_clusters || CLUSTERS_OK=0
+
+# --- 1. Hub: policies first, so RHACM stops re-creating objects --------------
+if hub get namespace "$POLICY_NS" >/dev/null 2>&1; then
+  hub delete policies.policy.open-cluster-management.io --all -n "$POLICY_NS" --ignore-not-found >/dev/null 2>&1
+  hub delete placementbindings.policy.open-cluster-management.io --all -n "$POLICY_NS" --ignore-not-found >/dev/null 2>&1
+  hub delete placements.cluster.open-cluster-management.io --all -n "$POLICY_NS" --ignore-not-found >/dev/null 2>&1
+  info "Hub: lab policies, placements and bindings deleted"
+fi
+
+# --- 2. Managed clusters -------------------------------------------------------
+if [[ "$CLUSTERS_OK" -eq 1 ]]; then
+  KUBE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gk-finish.XXXXXX")"
+  trap 'rm -rf -- "$KUBE_DIR"' EXIT
+
+  # Wait until RHACM has withdrawn the replicated policies from both clusters
+  for c in "$STAGE_CLUSTER" "$PROD_CLUSTER"; do
+    wait_until_gone 120 bash -c "oc --request-timeout=30s get policies.policy.open-cluster-management.io -n '$c' -o name 2>/dev/null | grep -q '/${POLICY_NS}\.'" \
+      || warn "${c}: replicated lab policies still present after 2 minutes, continuing anyway"
+  done
+
+  for pair in "stage:${STAGE_CLUSTER}" "production:${PROD_CLUSTER}"; do
+    role="${pair%%:*}"; name="${pair#*:}"
+    if fetch_kubeconfig "$name" "$KUBE_DIR/${role}.kubeconfig"; then
+      cleanup_cluster "$role" "$name"
+    else
+      warn "${name}: cannot reach the cluster, its cleanup was skipped. Run this script again later."
+    fi
+  done
+
+  # --- 3. Restore the environment labels -------------------------------------
+  if [[ "$STATE_LOADED" -eq 1 ]]; then
+    restore_label "$STAGE_CLUSTER" "${PREV_ENV_STAGE:-}"
+    restore_label "$PROD_CLUSTER" "${PREV_ENV_PROD:-}"
+    [[ -n "${PREV_ENV_HUB:-}" ]] && restore_label local-cluster "$PREV_ENV_HUB"
+  else
+    # No saved state: remove only the labels this lab sets
+    [[ "$(hub get managedcluster "$STAGE_CLUSTER" -o jsonpath='{.metadata.labels.environment}' 2>/dev/null)" == "stage" ]] \
+      && restore_label "$STAGE_CLUSTER" ""
+    [[ "$(hub get managedcluster "$PROD_CLUSTER" -o jsonpath='{.metadata.labels.environment}' 2>/dev/null)" == "production" ]] \
+      && restore_label "$PROD_CLUSTER" ""
+  fi
+  info "Hub: environment labels restored"
+else
+  warn "Managed clusters could not be identified - only the hub was cleaned."
+fi
+
+# --- 4. Hub namespace (also removes the ManagedClusterSetBinding) -------------
+if hub get namespace "$POLICY_NS" >/dev/null 2>&1; then
+  [[ "$(hub project -q 2>/dev/null)" == "$POLICY_NS" ]] && hub project default >/dev/null 2>&1
+  hub delete namespace "$POLICY_NS" --wait=false >/dev/null 2>&1
+  info "Hub: namespace '${POLICY_NS}' deleted"
+fi
+
+# --- 5. Local lab files ------------------------------------------------------------
+if [[ -d "$WORK_DIR" && "$WORK_DIR" == "${HOME}/lab-work/${LAB_ID}" ]]; then
+  rm -rf -- "$WORK_DIR"
+  info "Bastion: ${WORK_DIR} removed"
+fi
+
+echo ""
+echo "✅ Environment is clean for the next lab!"
