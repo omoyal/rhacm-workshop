@@ -1,0 +1,14 @@
+{
+  "hub_context": "REPLACE_WITH_HUB_CONTEXT",
+  "stage_context": "REPLACE_WITH_STAGE_CONTEXT",
+  "prod_context": "REPLACE_WITH_PRODUCTION_CONTEXT",
+  "stage_cluster": "cluster2-sno",
+  "prod_cluster": "cluster1",
+  "image_latest": "registry.access.redhat.com/ubi9/python-312:latest",
+  "image_pinned": "REPLACE_WITH_SAME_IMAGE_AT_SHA256_DIGEST",
+  "gatekeeper_package": "gatekeeper-operator-product",
+  "gatekeeper_channel": "stable",
+  "gatekeeper_catalog": "redhat-operators",
+  "gatekeeper_catalog_namespace": "openshift-marketplace",
+  "gatekeeper_namespace": "openshift-gatekeeper-system"
+}

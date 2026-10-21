@@ -1,0 +1,5 @@
+
+# Local workshop configuration and generated files
+.workshop/
+workshop-config.json
+__pycache__/
