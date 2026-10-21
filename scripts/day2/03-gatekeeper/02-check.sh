@@ -137,7 +137,7 @@ check 10 "Constraint 'containerimagelatest' is deployed on '${TARGET_CLUSTER}'" 
          "Step 5: check the policy Results tab for errors" \
          t_constraint
 check 15 "prod-hello runs in 'app-prod' with a pinned image tag" \
-         "Step 7: set the image tag to v1.0 in prod-hello.yaml, delete the leftovers and create it again" \
+         "Step 6: set the image tag to v1.0 in prod-hello.yaml, delete the leftovers and create it again" \
          t_prod_hello
 check 10 "Gatekeeper denies ':latest' images (live test)" \
          "Steps 4-5: Gatekeeper and the constraint must both be active" \
