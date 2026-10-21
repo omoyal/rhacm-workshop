@@ -22,6 +22,11 @@ Use RHACM Governance to install Gatekeeper on both managed clusters, then enforc
 From the repository root, run:
 
 ```bash
+cd ~/rhacm-workshop/
+git pull
+```
+
+```bash
 bash scripts/day2/03-gatekeeper/01-lab-start.sh
 ```
 
