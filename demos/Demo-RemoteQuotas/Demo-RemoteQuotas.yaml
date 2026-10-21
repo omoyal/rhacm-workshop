@@ -1,0 +1,69 @@
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: demo-remote-quotas
+  namespace: demo-policies
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: SC System and Communications Protection
+    policy.open-cluster-management.io/controls: SC-6 Resource Availability
+spec:
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: demo-remote-quotas
+        spec:
+          remediationAction: enforce
+          pruneObjectBehavior: DeleteIfCreated
+          severity: medium
+          object-templates:
+            # One quota shared by ALL projects labeled team=demo-team
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: quota.openshift.io/v1
+                kind: ClusterResourceQuota
+                metadata:
+                  name: demo-team-quota
+                spec:
+                  selector:
+                    labels:
+                      matchLabels:
+                        team: demo-team
+                  quota:
+                    hard:
+                      pods: "6"
+                      services: "10"
+                      persistentvolumeclaims: "5"
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: demo-remote-quotas-placement
+  namespace: demo-policies
+spec:
+  clusterSets:
+    - default
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: name
+              operator: In
+              values: [cluster1]
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: demo-remote-quotas-binding
+  namespace: demo-policies
+placementRef:
+  name: demo-remote-quotas-placement
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: demo-remote-quotas
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io

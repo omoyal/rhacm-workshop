@@ -1,0 +1,134 @@
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: demo-resource-limits
+  namespace: demo-policies
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: SC System and Communications Protection
+    policy.open-cluster-management.io/controls: SC-6 Resource Availability
+spec:
+  disabled: false
+  policy-templates:
+    # PROJECT level: a budget and per-container defaults for every enforced namespace
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: demo-project-limits
+        spec:
+          remediationAction: enforce
+          pruneObjectBehavior: DeleteIfCreated
+          severity: medium
+          namespaceSelector:
+            matchLabels:
+              org-policy: enforced
+          object-templates:
+            # Total budget for the whole project
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: ResourceQuota
+                metadata:
+                  name: demo-project-quota
+                spec:
+                  hard:
+                    requests.cpu: "2"
+                    requests.memory: 4Gi
+                    limits.cpu: "4"
+                    limits.memory: 8Gi
+                    pods: "10"
+            # Defaults and maximum for each container in the project
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: LimitRange
+                metadata:
+                  name: demo-container-limits
+                spec:
+                  limits:
+                    - type: Container
+                      default:
+                        cpu: 500m
+                        memory: 512Mi
+                      defaultRequest:
+                        cpu: 100m
+                        memory: 128Mi
+                      max:
+                        cpu: "2"
+                        memory: 2Gi
+    # DEPLOYMENT level: every Deployment must declare its own requests and limits
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: demo-deployment-limits
+        spec:
+          remediationAction: enforce
+          pruneObjectBehavior: DeleteIfCreated
+          severity: medium
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: admissionregistration.k8s.io/v1
+                kind: ValidatingAdmissionPolicy
+                metadata:
+                  name: demo-deployment-limits
+                spec:
+                  failurePolicy: Fail
+                  matchConstraints:
+                    resourceRules:
+                      - apiGroups: ["apps"]
+                        apiVersions: ["v1"]
+                        operations: ["CREATE", "UPDATE"]
+                        resources: ["deployments"]
+                  validations:
+                    - expression: >-
+                        object.spec.template.spec.containers.all(c,
+                        has(c.resources) && has(c.resources.requests) && has(c.resources.limits) &&
+                        'cpu' in c.resources.requests && 'memory' in c.resources.requests &&
+                        'cpu' in c.resources.limits && 'memory' in c.resources.limits)
+                      message: "Every container must declare CPU and memory requests and limits."
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: admissionregistration.k8s.io/v1
+                kind: ValidatingAdmissionPolicyBinding
+                metadata:
+                  name: demo-deployment-limits
+                spec:
+                  policyName: demo-deployment-limits
+                  validationActions: ["Deny"]
+                  matchResources:
+                    namespaceSelector:
+                      matchLabels:
+                        org-policy: enforced
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: demo-resource-limits-placement
+  namespace: demo-policies
+spec:
+  clusterSets:
+    - default
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: name
+              operator: In
+              values: [cluster1]
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: demo-resource-limits-binding
+  namespace: demo-policies
+placementRef:
+  name: demo-resource-limits-placement
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: demo-resource-limits
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io

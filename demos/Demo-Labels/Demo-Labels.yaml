@@ -1,0 +1,91 @@
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: demo-labels
+  namespace: demo-policies
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-8 System Component Inventory
+spec:
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: demo-labels
+        spec:
+          remediationAction: enforce
+          pruneObjectBehavior: DeleteIfCreated
+          severity: medium
+          object-templates:
+            # The rule: Deployments must carry the required labels
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: admissionregistration.k8s.io/v1
+                kind: ValidatingAdmissionPolicy
+                metadata:
+                  name: demo-required-labels
+                spec:
+                  failurePolicy: Fail
+                  matchConstraints:
+                    resourceRules:
+                      - apiGroups: ["apps"]
+                        apiVersions: ["v1"]
+                        operations: ["CREATE", "UPDATE"]
+                        resources: ["deployments"]
+                  validations:
+                    - expression: >-
+                        has(object.metadata.labels) &&
+                        'app.kubernetes.io/name' in object.metadata.labels &&
+                        'owner' in object.metadata.labels
+                      message: "Deployments must have the labels 'app.kubernetes.io/name' and 'owner'."
+                    - expression: >-
+                        has(object.spec.template.metadata.labels) &&
+                        'app.kubernetes.io/name' in object.spec.template.metadata.labels
+                      message: "The pod template must have the label 'app.kubernetes.io/name'."
+            # Where the rule applies: namespaces labeled org-policy=enforced
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: admissionregistration.k8s.io/v1
+                kind: ValidatingAdmissionPolicyBinding
+                metadata:
+                  name: demo-required-labels
+                spec:
+                  policyName: demo-required-labels
+                  validationActions: ["Deny"]
+                  matchResources:
+                    namespaceSelector:
+                      matchLabels:
+                        org-policy: enforced
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: demo-labels-placement
+  namespace: demo-policies
+spec:
+  clusterSets:
+    - default
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: name
+              operator: In
+              values: [cluster1]
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: demo-labels-binding
+  namespace: demo-policies
+placementRef:
+  name: demo-labels-placement
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: demo-labels
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io

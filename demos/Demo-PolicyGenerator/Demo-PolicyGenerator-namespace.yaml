@@ -1,0 +1,8 @@
+# A plain Kubernetes manifest. The Policy Generator wraps it into an RHACM Policy.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-gitops
+  labels:
+    owner: platform-team
+    org-policy: enforced

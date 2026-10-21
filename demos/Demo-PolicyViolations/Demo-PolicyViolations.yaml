@@ -1,0 +1,215 @@
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: demo-policy-violations
+  namespace: demo-policies
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CA Assessment, Authorization, and Monitoring
+    policy.open-cluster-management.io/controls: CA-7 Continuous Monitoring
+spec:
+  disabled: false
+  policy-templates:
+    # ---------- IDENTIFY (inform = report only) ----------
+    # RBAC: cluster-admin granted directly to a user
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: demo-audit-rbac
+        spec:
+          remediationAction: inform
+          severity: high
+          object-templates:
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: ClusterRoleBinding
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: ClusterRole
+                  name: cluster-admin
+                subjects:
+                  - apiGroup: rbac.authorization.k8s.io
+                    kind: User
+    # SCC: application pods running with privileged or anyuid SCC
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: demo-audit-scc
+        spec:
+          remediationAction: inform
+          severity: high
+          namespaceSelector:
+            include: ["*"]
+            exclude: ["openshift*", "kube*", "default", "open-cluster-management*", "hive", "multicluster-engine"]
+          object-templates:
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: v1
+                kind: Pod
+                metadata:
+                  annotations:
+                    openshift.io/scc: privileged
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: v1
+                kind: Pod
+                metadata:
+                  annotations:
+                    openshift.io/scc: anyuid
+    # NetPol: every enforced namespace must have an ingress NetworkPolicy
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: demo-audit-netpol
+        spec:
+          remediationAction: inform
+          severity: medium
+          namespaceSelector:
+            matchLabels:
+              org-policy: enforced
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: networking.k8s.io/v1
+                kind: NetworkPolicy
+                spec:
+                  policyTypes:
+                    - Ingress
+    # Labels: enforced namespaces and their Deployments must have an 'owner' label
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: demo-audit-labels
+        spec:
+          remediationAction: inform
+          severity: medium
+          object-templates-raw: |
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: Namespace
+                metadata:
+                  name: default
+            {{- range $ns := (lookup "v1" "Namespace" "" "" "org-policy=enforced,!owner").items }}
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: v1
+                kind: Namespace
+                metadata:
+                  name: {{ $ns.metadata.name }}
+            {{- end }}
+            {{- range $ns := (lookup "v1" "Namespace" "" "" "org-policy=enforced").items }}
+            {{- range $d := (lookup "apps/v1" "Deployment" $ns.metadata.name "" "!owner").items }}
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: apps/v1
+                kind: Deployment
+                metadata:
+                  name: {{ $d.metadata.name }}
+                  namespace: {{ $ns.metadata.name }}
+            {{- end }}
+            {{- end }}
+    # ---------- PREVENT (enforce = block at admission) ----------
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: demo-guardrails
+        spec:
+          remediationAction: enforce
+          pruneObjectBehavior: DeleteIfCreated
+          severity: high
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: admissionregistration.k8s.io/v1
+                kind: ValidatingAdmissionPolicy
+                metadata:
+                  name: demo-org-guardrails
+                spec:
+                  failurePolicy: Fail
+                  matchConstraints:
+                    resourceRules:
+                      - apiGroups: ["rbac.authorization.k8s.io"]
+                        apiVersions: ["v1"]
+                        operations: ["CREATE", "UPDATE"]
+                        resources: ["rolebindings"]
+                      - apiGroups: ["apps"]
+                        apiVersions: ["v1"]
+                        operations: ["CREATE", "UPDATE"]
+                        resources: ["deployments"]
+                      - apiGroups: ["networking.k8s.io"]
+                        apiVersions: ["v1"]
+                        operations: ["DELETE"]
+                        resources: ["networkpolicies"]
+                  validations:
+                    # RBAC: no cluster-admin inside an application namespace
+                    - expression: >-
+                        request.kind.kind != 'RoleBinding' ||
+                        object.roleRef.name != 'cluster-admin'
+                      message: "RBAC: binding 'cluster-admin' in this namespace is not allowed."
+                    # SCC: no privileged containers
+                    - expression: >-
+                        request.kind.kind != 'Deployment' ||
+                        object.spec.template.spec.containers.all(c,
+                        !has(c.securityContext) || !has(c.securityContext.privileged) ||
+                        c.securityContext.privileged == false)
+                      message: "SCC: privileged containers are not allowed."
+                    # Labels: Deployments must have an owner
+                    - expression: >-
+                        request.kind.kind != 'Deployment' ||
+                        (has(object.metadata.labels) && 'owner' in object.metadata.labels)
+                      message: "Labels: Deployments must have the label 'owner'."
+                    # NetPol: the default-deny policy cannot be deleted
+                    - expression: >-
+                        request.kind.kind != 'NetworkPolicy' ||
+                        oldObject.metadata.name != 'default-deny-all'
+                      message: "NetPol: the 'default-deny-all' NetworkPolicy cannot be deleted."
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: admissionregistration.k8s.io/v1
+                kind: ValidatingAdmissionPolicyBinding
+                metadata:
+                  name: demo-org-guardrails
+                spec:
+                  policyName: demo-org-guardrails
+                  validationActions: ["Deny"]
+                  matchResources:
+                    namespaceSelector:
+                      matchLabels:
+                        org-policy: enforced
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: demo-policy-violations-placement
+  namespace: demo-policies
+spec:
+  clusterSets:
+    - default
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: name
+              operator: In
+              values: [cluster1]
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: demo-policy-violations-binding
+  namespace: demo-policies
+placementRef:
+  name: demo-policy-violations-placement
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: demo-policy-violations
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io

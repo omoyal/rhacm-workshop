@@ -1,0 +1,19 @@
+apiVersion: policy.open-cluster-management.io/v1
+kind: PolicyGenerator
+metadata:
+  name: demo-policy-generator
+policyDefaults:
+  namespace: demo-policies
+  remediationAction: enforce
+  pruneObjectBehavior: DeleteIfCreated
+  severity: medium
+  placement:
+    labelSelector:
+      matchExpressions:
+        - key: name
+          operator: In
+          values: [cluster1]
+policies:
+  - name: demo-gitops-namespace
+    manifests:
+      - path: Demo-PolicyGenerator-namespace.yaml

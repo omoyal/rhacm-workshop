@@ -1,0 +1,99 @@
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: demo-database-encryption
+  namespace: demo-policies
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: SC System and Communications Protection
+    policy.open-cluster-management.io/controls: SC-28 Protection Of Information At Rest
+spec:
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: demo-database-encryption
+        spec:
+          remediationAction: enforce
+          pruneObjectBehavior: DeleteIfCreated
+          severity: high
+          object-templates:
+            # 1) An encrypted StorageClass (AWS EBS)
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: storage.k8s.io/v1
+                kind: StorageClass
+                metadata:
+                  name: demo-encrypted-gp3
+                provisioner: ebs.csi.aws.com
+                parameters:
+                  type: gp3
+                  encrypted: "true"
+                reclaimPolicy: Delete
+                volumeBindingMode: WaitForFirstConsumer
+                allowVolumeExpansion: true
+            # 2) The rule: in sensitive namespaces, volumes must use the encrypted class
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: admissionregistration.k8s.io/v1
+                kind: ValidatingAdmissionPolicy
+                metadata:
+                  name: demo-encrypted-storage-only
+                spec:
+                  failurePolicy: Fail
+                  matchConstraints:
+                    resourceRules:
+                      - apiGroups: [""]
+                        apiVersions: ["v1"]
+                        operations: ["CREATE"]
+                        resources: ["persistentvolumeclaims"]
+                  validations:
+                    - expression: >-
+                        has(object.spec.storageClassName) &&
+                        object.spec.storageClassName == 'demo-encrypted-gp3'
+                      message: "Data in this namespace must be stored on the encrypted StorageClass 'demo-encrypted-gp3'."
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: admissionregistration.k8s.io/v1
+                kind: ValidatingAdmissionPolicyBinding
+                metadata:
+                  name: demo-encrypted-storage-only
+                spec:
+                  policyName: demo-encrypted-storage-only
+                  validationActions: ["Deny"]
+                  matchResources:
+                    namespaceSelector:
+                      matchLabels:
+                        data-classification: sensitive
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: demo-database-encryption-placement
+  namespace: demo-policies
+spec:
+  clusterSets:
+    - default
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: name
+              operator: In
+              values: [cluster1]
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: demo-database-encryption-binding
+  namespace: demo-policies
+placementRef:
+  name: demo-database-encryption-placement
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: demo-database-encryption
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io

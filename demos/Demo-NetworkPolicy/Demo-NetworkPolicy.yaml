@@ -1,0 +1,95 @@
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: demo-network-policy
+  namespace: demo-policies
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: SC System and Communications Protection
+    policy.open-cluster-management.io/controls: SC-7 Boundary Protection
+spec:
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: demo-network-policy
+        spec:
+          remediationAction: enforce
+          pruneObjectBehavior: DeleteIfCreated
+          severity: high
+          # Created in every namespace labeled org-policy=enforced
+          namespaceSelector:
+            matchLabels:
+              org-policy: enforced
+          object-templates:
+            # 1) Block all incoming traffic by default
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: networking.k8s.io/v1
+                kind: NetworkPolicy
+                metadata:
+                  name: default-deny-all
+                spec:
+                  podSelector: {}
+                  policyTypes:
+                    - Ingress
+            # 2) Allow traffic between pods of the same namespace
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: networking.k8s.io/v1
+                kind: NetworkPolicy
+                metadata:
+                  name: allow-same-namespace
+                spec:
+                  podSelector: {}
+                  ingress:
+                    - from:
+                        - podSelector: {}
+            # 3) Allow traffic from the OpenShift router (Routes)
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: networking.k8s.io/v1
+                kind: NetworkPolicy
+                metadata:
+                  name: allow-from-openshift-ingress
+                spec:
+                  podSelector: {}
+                  ingress:
+                    - from:
+                        - namespaceSelector:
+                            matchLabels:
+                              policy-group.network.openshift.io/ingress: ""
+                  policyTypes:
+                    - Ingress
+---
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
+metadata:
+  name: demo-network-policy-placement
+  namespace: demo-policies
+spec:
+  clusterSets:
+    - default
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchExpressions:
+            - key: name
+              operator: In
+              values: [cluster1]
+---
+apiVersion: policy.open-cluster-management.io/v1
+kind: PlacementBinding
+metadata:
+  name: demo-network-policy-binding
+  namespace: demo-policies
+placementRef:
+  name: demo-network-policy-placement
+  kind: Placement
+  apiGroup: cluster.open-cluster-management.io
+subjects:
+  - name: demo-network-policy
+    kind: Policy
+    apiGroup: policy.open-cluster-management.io
