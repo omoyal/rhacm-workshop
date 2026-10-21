@@ -84,6 +84,16 @@ wait_until_gone() {   # $1 seconds  $2.. command that succeeds while the object 
   return 0
 }
 
+# Root policies on the hub (any namespace) that install the Gatekeeper operator
+gatekeeper_policies() {
+  local p
+  for p in $(hub get policies.policy.open-cluster-management.io -A -l '!policy.open-cluster-management.io/root-policy' \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+    hub get policies.policy.open-cluster-management.io "${p#*/}" -n "${p%%/*}" -o yaml 2>/dev/null \
+      | grep "$OPERATOR_PACKAGE" >/dev/null && echo "$p"
+  done
+}
+
 restore_label() {   # $1 cluster  $2 previous value ("" = had no label)
   hub get managedcluster "$1" >/dev/null 2>&1 || return 0
   if [[ -n "$2" ]]; then
@@ -154,6 +164,12 @@ if hub get namespace "$POLICY_NS" >/dev/null 2>&1; then
   hub delete placements.cluster.open-cluster-management.io --all -n "$POLICY_NS" --ignore-not-found >/dev/null 2>&1
   info "Hub: lab policies, placements and bindings deleted"
 fi
+other_policies="$(gatekeeper_policies)"
+if [[ -n "$other_policies" ]]; then
+  warn "These RHACM policies (not part of this lab) also install Gatekeeper and will re-install it:"
+  sed 's/^/        - /' <<<"$other_policies"
+  warn "Delete them first if you want Gatekeeper fully removed, then run this script again."
+fi
 
 # --- 2. Managed clusters -------------------------------------------------------
 if [[ "$CLUSTERS_OK" -eq 1 ]]; then
@@ -162,7 +178,7 @@ if [[ "$CLUSTERS_OK" -eq 1 ]]; then
 
   # Wait until RHACM has withdrawn the replicated policies from both clusters
   for c in "$STAGE_CLUSTER" "$PROD_CLUSTER"; do
-    wait_until_gone 120 bash -c "oc --request-timeout=30s get policies.policy.open-cluster-management.io -n '$c' -o name 2>/dev/null | grep -q '/${POLICY_NS}\.'" \
+    wait_until_gone 120 bash -c "oc --request-timeout=30s get policies.policy.open-cluster-management.io -n '$c' -o name 2>/dev/null | grep '/${POLICY_NS}\.' >/dev/null" \
       || warn "${c}: replicated lab policies still present after 2 minutes, continuing anyway"
   done
 
