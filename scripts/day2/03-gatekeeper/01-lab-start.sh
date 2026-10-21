@@ -79,6 +79,16 @@ fetch_kubeconfig() {   # $1 = managed cluster name, $2 = destination file
 
 env_label() { hub get managedcluster "$1" -o jsonpath='{.metadata.labels.environment}' 2>/dev/null; }
 
+# Root policies on the hub (any namespace) that install the Gatekeeper operator
+gatekeeper_policies() {
+  local p
+  for p in $(hub get policies.policy.open-cluster-management.io -A -l '!policy.open-cluster-management.io/root-policy' \
+      -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+    hub get policies.policy.open-cluster-management.io "${p#*/}" -n "${p%%/*}" -o yaml 2>/dev/null \
+      | grep "$OPERATOR_PACKAGE" >/dev/null && echo "$p"
+  done
+}
+
 # ------------------------------------------------------------------- main ---
 echo "🚀 [LAB START] Preparing environment for the Gatekeeper Lab..."
 echo ""
@@ -105,6 +115,14 @@ info "Managed clusters are Available: ${STAGE_CLUSTER}, ${PROD_CLUSTER}"
 if hub get namespace "$POLICY_NS" >/dev/null 2>&1; then
   die "Namespace '${POLICY_NS}' already exists on the hub (left over from a previous attempt).
    Run ./03-lab-finish.sh first, then run this script again."
+fi
+other_policies="$(gatekeeper_policies)"
+if [[ -n "$other_policies" ]]; then
+  die "Another RHACM policy already installs Gatekeeper on your fleet:
+$(sed 's/^/      - /' <<<"$other_policies")
+   It would keep re-installing Gatekeeper. Delete it (with its Placement and PlacementBinding),
+   then run ./03-lab-finish.sh and this script again. Example:
+      oc delete policy <name> -n <namespace>"
 fi
 
 # --- 3. Admin access to both managed clusters ----------------------------------
