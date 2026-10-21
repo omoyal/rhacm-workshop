@@ -1,311 +1,365 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# =============================================================================
+#  Lab 3 - Integrate Gatekeeper with RHACM            | 01-lab-start.sh
+# -----------------------------------------------------------------------------
+#  Prepares the environment (equivalent of "lab start policies-integration"):
+#   1. Verifies you are logged in to your ACM hub
+#   2. Discovers your 2 managed clusters (sorted by name):
+#        1st -> environment=stage      2nd -> environment=production
+#      Override with:  STAGE_CLUSTER=<name> PROD_CLUSTER=<name> ./01-lab-start.sh
+#   3. Pulls the admin kubeconfig of each managed cluster from the hub (Hive)
+#   4. Labels the ManagedClusters and verifies the operator catalog
+#   5. Generates the lab files in ~/lab-work/03-gatekeeper
+# =============================================================================
+set -uo pipefail
 
-LAB_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/rhacm-gatekeeper-lab"
-# Use the active hub login. Never modify the user's kubeconfig.
-set +x
-command -v oc >/dev/null || { echo "ERROR: oc is required." >&2; exit 1; }
-command -v python3 >/dev/null || { echo "ERROR: python3 is required." >&2; exit 1; }
-HUB_CONTEXT=hub
-STAGE_CONTEXT=stage
-PROD_CONTEXT=production
-HUB_LOGIN="$(oc config current-context)" || exit 1
-oc --context "$HUB_LOGIN" get managedcluster cluster1 cluster2-sno -o name >/dev/null || {
-  echo "ERROR: Run from the workshop terminal logged in to your ACM hub, with access to cluster1 and cluster2-sno." >&2
-  exit 1
+LAB_ID="03-gatekeeper"
+WORK_DIR="${HOME}/lab-work/${LAB_ID}"
+STATE_FILE="${WORK_DIR}/.lab-state"
+POLICY_NS="policy-gatekeeper"
+LAB_LABEL_KEY="workshop.rhacm.io/lab"
+LAB_LABEL_VALUE="gatekeeper"
+APP_IMAGE="${APP_IMAGE:-quay.io/redhattraining/hello-world-nginx}"
+PINNED_TAG="${PINNED_TAG:-v1.0}"
+OPERATOR_PACKAGE="gatekeeper-operator-product"
+
+# ---------------------------------------------------------------- helpers ---
+die()  { echo "❌ [ERROR] $*" >&2; exit 1; }
+info() { echo "   • $*"; }
+warn() { echo "   ⚠️  $*"; }
+hub()  { oc --request-timeout=30s "$@"; }
+ocx()  { local role="$1"; shift; oc --request-timeout=30s --kubeconfig "${KUBE_DIR}/${role}.kubeconfig" "$@"; }
+
+require_hub() {
+  command -v oc >/dev/null 2>&1 || die "The 'oc' CLI was not found on this machine."
+  hub whoami >/dev/null 2>&1 || die "You are not logged in. Log in to your ACM hub with 'oc login' and run again."
+  hub get crd managedclusters.cluster.open-cluster-management.io >/dev/null 2>&1 \
+    || die "Your current 'oc' session is not the ACM hub. Run 'unset KUBECONFIG' (or log in to the hub) and run again."
 }
-ACCESS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/rhacm-gk-access.XXXXXXXX")"
-chmod 700 "$ACCESS_DIR"
-trap 'rm -rf -- "$ACCESS_DIR"' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-ocx() {
-  local role="$1"; shift
-  case "$role" in
-    hub) oc --context "$HUB_LOGIN" "$@" ;;
-    stage|production) oc --kubeconfig "$ACCESS_DIR/$role" "$@" ;;
-    *) echo "ERROR: Unknown cluster role: $role" >&2; return 1 ;;
-  esac
+
+load_state() {
+  local env_stage="${STAGE_CLUSTER:-}" env_prod="${PROD_CLUSTER:-}"
+  STATE_LOADED=0
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+    STATE_LOADED=1
+  fi
+  [[ -n "$env_stage" ]] && STAGE_CLUSTER="$env_stage"
+  [[ -n "$env_prod" ]] && PROD_CLUSTER="$env_prod"
+  return 0
 }
-resolve_access() {
-  local cluster="$1" role="$2" ref actual expected
-  ocx hub get clusterdeployments.hive.openshift.io -n "$cluster" -o json > "$ACCESS_DIR/deployments.json" || return 1
-  ref="$(python3 - "$ACCESS_DIR/deployments.json" "$cluster" <<'PYREF'
-import json,sys
-items=json.load(open(sys.argv[1]))['items']
-matched=[x for x in items if x['metadata']['name']==sys.argv[2] or x.get('spec',{}).get('clusterName')==sys.argv[2]]
-if not matched and len(items)==1: matched=items
-if len(matched)!=1: raise SystemExit('ERROR: Cannot uniquely identify the ClusterDeployment in '+sys.argv[2])
-m=matched[0].get('spec',{}).get('clusterMetadata') or {}
-ref=m.get('adminKubeconfigSecretRef',{}).get('name')
-if not ref: raise SystemExit('ERROR: ClusterDeployment has no adminKubeconfigSecretRef. Provisioning may be incomplete.')
-print(ref)
-PYREF
-)" || return 1
-  # Read only the Secret explicitly referenced by the target ClusterDeployment.
-  (umask 077
-   ocx hub get secret "$ref" -n "$cluster" -o jsonpath='{.data.kubeconfig}' |
-     python3 -c 'import base64,sys; data=sys.stdin.buffer.read().strip(); data or sys.exit("ERROR: Missing kubeconfig data"); sys.stdout.buffer.write(base64.b64decode(data,validate=True))' > "$ACCESS_DIR/$role"
-  ) || return 1
-  actual="$(ocx "$role" get clusterversion version -o jsonpath='{.spec.clusterID}')" || return 1
-  expected="$(python3 - "$ACCESS_DIR/deployments.json" "$ref" <<'PYID'
-import json,sys
-for x in json.load(open(sys.argv[1]))['items']:
- m=x.get('spec',{}).get('clusterMetadata') or {}
- if m.get('adminKubeconfigSecretRef',{}).get('name')==sys.argv[2]:
-  print(m.get('clusterID','')); break
-PYID
-)"
-  if [[ -n "$expected" && "$expected" != "$actual" ]]; then
-    echo "ERROR: Kubeconfig cluster identity does not match $cluster." >&2
+
+discover_clusters() {
+  [[ -n "${STAGE_CLUSTER:-}" && -n "${PROD_CLUSTER:-}" ]] && return 0
+  local managed=()
+  mapfile -t managed < <(hub get managedclusters -l 'local-cluster!=true' \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep -vx 'local-cluster' | grep -v '^$' | sort)
+  if [[ ${#managed[@]} -ne 2 ]]; then
+    echo "❌ Expected exactly 2 managed clusters (besides local-cluster), found ${#managed[@]}: ${managed[*]:-none}" >&2
+    echo "   Run again with:  STAGE_CLUSTER=<name> PROD_CLUSTER=<name> $0" >&2
     return 1
   fi
+  STAGE_CLUSTER="${managed[0]}"
+  PROD_CLUSTER="${managed[1]}"
 }
-resolve_access cluster2-sno stage || { echo "ERROR: Cannot obtain stage access through its ClusterDeployment. Check hub permissions and provisioning status." >&2; exit 1; }
-resolve_access cluster1 production || { echo "ERROR: Cannot obtain production access through its ClusterDeployment. Check hub permissions and provisioning status." >&2; exit 1; }
 
-# Optional command mode used by the participant guide; skips lab preparation.
-if [[ "${1:-}" == "oc" ]]; then
-  shift
-  [[ $# -ge 2 ]] || { echo "Usage: $0 oc hub|stage|production <oc arguments>" >&2; exit 1; }
-  ocx "$@"
-  exit
+fetch_kubeconfig() {   # $1 = managed cluster name, $2 = destination file
+  local cluster="$1" dest="$2" cd secret
+  cd="$(hub get clusterdeployments.hive.openshift.io -n "$cluster" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+  [[ -n "$cd" ]] || { echo "❌ No ClusterDeployment found for '$cluster' (this lab expects clusters created by ACM)." >&2; return 1; }
+  secret="$(hub get clusterdeployments.hive.openshift.io "$cd" -n "$cluster" \
+      -o jsonpath='{.spec.clusterMetadata.adminKubeconfigSecretRef.name}' 2>/dev/null)"
+  [[ -n "$secret" ]] || { echo "❌ '$cluster' has no admin kubeconfig yet. Is it fully provisioned?" >&2; return 1; }
+  ( umask 077; hub extract "secret/${secret}" -n "$cluster" --keys=kubeconfig --to=- >"$dest" 2>/dev/null ) \
+    || { echo "❌ Cannot read the admin kubeconfig of '$cluster'." >&2; return 1; }
+  oc --request-timeout=30s --kubeconfig "$dest" get clusterversion version -o name >/dev/null 2>&1 \
+    || { echo "❌ The API of '$cluster' is not reachable from this bastion." >&2; return 1; }
+}
+
+env_label() { hub get managedcluster "$1" -o jsonpath='{.metadata.labels.environment}' 2>/dev/null; }
+
+# ------------------------------------------------------------------- main ---
+echo "🚀 [LAB START] Preparing environment for the Gatekeeper Lab..."
+echo ""
+
+require_hub
+info "Logged in to the ACM hub as: $(hub whoami)"
+
+load_state
+discover_clusters || exit 1
+[[ "$STAGE_CLUSTER" != "$PROD_CLUSTER" ]] || die "Stage and production must be two different clusters."
+
+# --- 1. Managed clusters are healthy and in the 'default' cluster set ---------
+for c in "$STAGE_CLUSTER" "$PROD_CLUSTER"; do
+  hub get managedcluster "$c" >/dev/null 2>&1 || die "ManagedCluster '$c' does not exist on the hub."
+  avail="$(hub get managedcluster "$c" -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}')"
+  [[ "$avail" == "True" ]] || die "ManagedCluster '$c' is not Available. Check Infrastructure > Clusters in the console."
+  cset="$(hub get managedcluster "$c" -o jsonpath='{.metadata.labels.cluster\.open-cluster-management\.io/clusterset}')"
+  [[ "$cset" == "default" ]] || die "Cluster '$c' is in cluster set '${cset:-<none>}', but this lab uses the 'default' set.
+   Move it with: oc label managedcluster $c cluster.open-cluster-management.io/clusterset=default --overwrite"
+done
+info "Managed clusters are Available: ${STAGE_CLUSTER}, ${PROD_CLUSTER}"
+
+# --- 2. Clean starting point -------------------------------------------------
+if hub get namespace "$POLICY_NS" >/dev/null 2>&1; then
+  die "Namespace '${POLICY_NS}' already exists on the hub (left over from a previous attempt).
+   Run ./03-lab-finish.sh first, then run this script again."
 fi
-STAGE_CLUSTER=cluster2-sno
-PROD_CLUSTER=cluster1
-OWNER_LABEL=workshop.rhacm.io/owner
-OWNER_VALUE=gatekeeper-lab
-TARGET_LABEL=workshop.rhacm.io/gatekeeper-target
-die() { echo "ERROR: $*" >&2; exit 1; }
 
-echo "Checking hub and managed clusters..."
-ocx "$HUB_CONTEXT" get managedcluster "$STAGE_CLUSTER" -o name >/dev/null || die "Cannot find ManagedCluster $STAGE_CLUSTER on the hub."
-ocx "$HUB_CONTEXT" get managedcluster "$PROD_CLUSTER" -o name >/dev/null || die "Cannot find ManagedCluster $PROD_CLUSTER on the hub."
-for cluster in "$STAGE_CLUSTER" "$PROD_CLUSTER"; do
-  available="$(ocx "$HUB_CONTEXT" get managedcluster "$cluster" -o jsonpath='{.status.conditions[?(@.type=="ManagedClusterConditionAvailable")].status}')"
-  [[ "$available" == "True" ]] || die "ManagedCluster $cluster is not Available. Check RHACM before continuing."
-done
+# --- 3. Admin access to both managed clusters ----------------------------------
+mkdir -p "$WORK_DIR/.kube"
+chmod 700 "$WORK_DIR" "$WORK_DIR/.kube"
+KUBE_DIR="$WORK_DIR/.kube"
+fetch_kubeconfig "$STAGE_CLUSTER" "$KUBE_DIR/stage.kubeconfig" || exit 1
+fetch_kubeconfig "$PROD_CLUSTER" "$KUBE_DIR/production.kubeconfig" || exit 1
+info "Admin access to both managed clusters verified"
 
-for pair in "$STAGE_CONTEXT:$STAGE_CLUSTER" "$PROD_CONTEXT:$PROD_CLUSTER"; do
-  ctx="${pair%%:*}"; cluster="${pair#*:}"
-  ocx "$ctx" get clusterversion version -o name >/dev/null || die "Context '$ctx' cannot read the OpenShift cluster version."
-  ocx "$ctx" get catalogsource redhat-operators -n openshift-marketplace -o name >/dev/null || die "CatalogSource redhat-operators is missing on $cluster."
-done
-
-ensure_namespace() {
-  local ctx="$1" name="$2" owner
-  if ocx "$ctx" get namespace "$name" >/dev/null 2>&1; then
-    owner="$(ocx "$ctx" get namespace "$name" -o "go-template={{index .metadata.labels \"$OWNER_LABEL\"}}")"
-    [[ "$owner" == "$OWNER_VALUE" ]] || die "Namespace $name already exists and is not owned by this lab. Remove the conflict manually or choose another name."
-  else
-    ocx "$ctx" create namespace "$name" >/dev/null
-    ocx "$ctx" label namespace "$name" "$OWNER_LABEL=$OWNER_VALUE" >/dev/null
+for role in stage production; do
+  if ocx "$role" get crd gatekeepers.operator.gatekeeper.sh >/dev/null 2>&1; then
+    die "Gatekeeper is already installed on the ${role} cluster (left over from a previous attempt).
+   Run ./03-lab-finish.sh first, then run this script again."
   fi
-}
+  for ns in app-stage app-test app-prod; do
+    ocx "$role" get namespace "$ns" >/dev/null 2>&1 \
+      && die "Namespace '$ns' already exists on the ${role} cluster. Run ./03-lab-finish.sh first."
+  done
+done
 
-ensure_namespace "$HUB_CONTEXT" ws-gatekeeper-lab
-ensure_namespace "$STAGE_CONTEXT" ws-stage
-ensure_namespace "$STAGE_CONTEXT" ws-stage-exempt
-ensure_namespace "$PROD_CONTEXT" ws-prod
+# --- 4. The Gatekeeper operator is available in the catalog ------------------
+CATALOG_SOURCE=""
+for role in stage production; do
+  sources="$(ocx "$role" get packagemanifests -n openshift-marketplace \
+      -o jsonpath="{range .items[?(@.metadata.name==\"${OPERATOR_PACKAGE}\")]}{.status.catalogSource}{\"\\n\"}{end}" 2>/dev/null)"
+  [[ -n "$sources" ]] || die "The '${OPERATOR_PACKAGE}' operator is not available in the catalog of the ${role} cluster."
+  if grep -qx 'redhat-operators' <<<"$sources"; then src="redhat-operators"; else src="$(head -n1 <<<"$sources")"; fi
+  [[ -z "$CATALOG_SOURCE" ]] && CATALOG_SOURCE="$src"
+  [[ "$src" == "$CATALOG_SOURCE" ]] || warn "Catalog source differs between clusters (${CATALOG_SOURCE} vs ${src})"
+done
+info "Gatekeeper operator found in catalog source: ${CATALOG_SOURCE}"
 
-for cluster in "$STAGE_CLUSTER" "$PROD_CLUSTER"; do
-  current="$(ocx "$HUB_CONTEXT" get managedcluster "$cluster" -o "go-template={{with index .metadata.labels \"$TARGET_LABEL\"}}{{.}}{{end}}")"
-  [[ -z "$current" || "$current" == "true" ]] || die "ManagedCluster $cluster already has $TARGET_LABEL=$current. Resolve this label before continuing."
-  if [[ -z "$current" ]]; then
-    ocx "$HUB_CONTEXT" label managedcluster "$cluster" "$TARGET_LABEL=true" >/dev/null
+# --- 5. Environment labels (previous values are saved for 03-lab-finish.sh) --
+if [[ "$STATE_LOADED" -ne 1 ]]; then
+  PREV_ENV_STAGE="$(env_label "$STAGE_CLUSTER")"
+  PREV_ENV_PROD="$(env_label "$PROD_CLUSTER")"
+  PREV_ENV_HUB="$(env_label local-cluster)"
+fi
+hub label managedcluster "$STAGE_CLUSTER" environment=stage --overwrite >/dev/null || die "Cannot label $STAGE_CLUSTER"
+hub label managedcluster "$PROD_CLUSTER" environment=production --overwrite >/dev/null || die "Cannot label $PROD_CLUSTER"
+hub_env="$(env_label local-cluster)"
+if [[ "$hub_env" == "stage" || "$hub_env" == "production" ]]; then
+  hub label managedcluster local-cluster environment- >/dev/null
+  warn "Removed 'environment=${hub_env}' from local-cluster so the hub is not targeted (restored on finish)"
+fi
+info "Labeled ${STAGE_CLUSTER} environment=stage and ${PROD_CLUSTER} environment=production"
+
+# --- 6. Demo image (checked from the bastion; non-fatal) ---------------------
+for tag in latest "$PINNED_TAG"; do
+  if ! oc image info "${APP_IMAGE}:${tag}" >/dev/null 2>&1; then
+    warn "Could not verify ${APP_IMAGE}:${tag} from the bastion. If the app pods fail to pull, tell your instructor."
   fi
 done
 
-ocx "$HUB_CONTEXT" apply -f - >/dev/null <<'YAML'
-apiVersion: cluster.open-cluster-management.io/v1beta2
-kind: ManagedClusterSetBinding
-metadata:
-  name: default
-  namespace: ws-gatekeeper-lab
-spec:
-  clusterSet: default
-YAML
+# --- 7. State file ------------------------------------------------------------
+{
+  printf 'STAGE_CLUSTER=%q\n'  "$STAGE_CLUSTER"
+  printf 'PROD_CLUSTER=%q\n'   "$PROD_CLUSTER"
+  printf 'CATALOG_SOURCE=%q\n' "$CATALOG_SOURCE"
+  printf 'APP_IMAGE=%q\n'      "$APP_IMAGE"
+  printf 'PINNED_TAG=%q\n'     "$PINNED_TAG"
+  printf 'PREV_ENV_STAGE=%q\n' "${PREV_ENV_STAGE:-}"
+  printf 'PREV_ENV_PROD=%q\n'  "${PREV_ENV_PROD:-}"
+  printf 'PREV_ENV_HUB=%q\n'   "${PREV_ENV_HUB:-}"
+} >"$STATE_FILE"
 
-mkdir -p "$LAB_DIR"
-# Non-secret files only. Access credentials live in ACCESS_DIR and are removed on exit.
-rm -f "$LAB_DIR/hub-context" "$LAB_DIR/stage-context" "$LAB_DIR/prod-context"
+# --- 8. Lab files ----------------------------------------------------------------
+cat >"$WORK_DIR/env.sh" <<EOF
+# Load the lab helpers into your shell:   source ~/lab-work/${LAB_ID}/env.sh
+#   oc       -> your ACM hub (unchanged)
+#   oc-stage -> ${STAGE_CLUSTER} (environment=stage)
+#   oc-prod  -> ${PROD_CLUSTER} (environment=production)
+oc-stage() { oc --kubeconfig "${KUBE_DIR}/stage.kubeconfig" "\$@"; }
+oc-prod()  { oc --kubeconfig "${KUBE_DIR}/production.kubeconfig" "\$@"; }
+echo "🔧 Helpers loaded:  oc -> hub  |  oc-stage -> ${STAGE_CLUSTER}  |  oc-prod -> ${PROD_CLUSTER}"
+EOF
 
-cat > "$LAB_DIR/install-gatekeeper.yaml" <<'YAML'
+cat >"$WORK_DIR/policy-latest.yaml" <<'EOF'
 apiVersion: policy.open-cluster-management.io/v1
 kind: Policy
 metadata:
-  name: ws-gatekeeper-install
-  namespace: ws-gatekeeper-lab
+  name: policy-gatekeeper-containerimage-latest
+  namespace: policy-gatekeeper
+  annotations:
+    policy.open-cluster-management.io/standards: NIST SP 800-53
+    policy.open-cluster-management.io/categories: CM Configuration Management
+    policy.open-cluster-management.io/controls: CM-2 Baseline Configuration
 spec:
-  remediationAction: enforce
   disabled: false
+  # No policy-level remediationAction on purpose: every template keeps its own
+  # action, so the Gatekeeper constraint below stays in "deny" mode.
   policy-templates:
+    # 1) Gatekeeper ConstraintTemplate - the rule logic (Rego)
     - objectDefinition:
-        apiVersion: policy.open-cluster-management.io/v1beta1
-        kind: OperatorPolicy
-        metadata:
-          name: ws-gatekeeper-operator
-        spec:
-          remediationAction: enforce
-          complianceType: musthave
-          severity: medium
-          upgradeApproval: Automatic
-          subscription:
-            namespace: openshift-operators
-            name: gatekeeper-operator-product
-            channel: stable
-            source: redhat-operators
-            sourceNamespace: openshift-marketplace
-    - objectDefinition:
-        apiVersion: policy.open-cluster-management.io/v1
-        kind: ConfigurationPolicy
-        metadata:
-          name: ws-gatekeeper-instance
-        spec:
-          remediationAction: enforce
-          severity: medium
-          object-templates:
-            - complianceType: musthave
-              objectDefinition:
-                apiVersion: operator.gatekeeper.sh/v1alpha1
-                kind: Gatekeeper
-                metadata:
-                  name: gatekeeper
-                spec:
-                  validatingWebhook: Enabled
-                  mutatingWebhook: Disabled
-                  config:
-                    disableDefaultMatches: false
-                    matches: []
----
-apiVersion: policy.open-cluster-management.io/v1
-kind: PlacementBinding
-metadata:
-  name: ws-gatekeeper-install
-  namespace: ws-gatekeeper-lab
-placementRef:
-  name: ws-gatekeeper-install
-  kind: Placement
-  apiGroup: cluster.open-cluster-management.io
-subjects:
-  - name: ws-gatekeeper-install
-    kind: Policy
-    apiGroup: policy.open-cluster-management.io
----
-apiVersion: cluster.open-cluster-management.io/v1beta1
-kind: Placement
-metadata:
-  name: ws-gatekeeper-install
-  namespace: ws-gatekeeper-lab
-spec:
-  clusterSets:
-    - default
-  predicates:
-    - requiredClusterSelector:
-        labelSelector:
-          matchLabels:
-            workshop.rhacm.io/gatekeeper-target: "true"
-YAML
-
-cp "$LAB_DIR/install-gatekeeper.yaml" "$LAB_DIR/install-gatekeeper-with-exclusion.yaml"
-python3 - "$LAB_DIR/install-gatekeeper-with-exclusion.yaml" <<'PY'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-s = p.read_text()
-s = s.replace('                    matches: []', '''                    matches:
-                      - excludedNamespaces:
-                          - ws-stage-exempt
-                        processes:
-                          - "*"''')
-if s == p.read_text():
-    raise SystemExit("Could not generate the Gatekeeper exclusion policy")
-p.write_text(s)
-PY
-
-cat > "$LAB_DIR/gatekeeper-constraints.yaml" <<'YAML'
-apiVersion: policy.open-cluster-management.io/v1
-kind: Policy
-metadata:
-  name: ws-gatekeeper-container-tags
-  namespace: ws-gatekeeper-lab
-spec:
-  remediationAction: enforce
-  disabled: false
-  policy-templates:
-    - objectDefinition:
-        apiVersion: templates.gatekeeper.sh/v1beta1
+        apiVersion: templates.gatekeeper.sh/v1
         kind: ConstraintTemplate
         metadata:
-          name: wscontainertags
+          name: containerimagelatest
         spec:
           crd:
             spec:
               names:
-                kind: WsContainerTags
-              validation:
-                openAPIV3Schema:
-                  type: object
+                kind: ContainerImageLatest
           targets:
             - target: admission.k8s.gatekeeper.sh
               rego: |
-                package wscontainertags
+                package containerimagelatest
 
                 violation[{"msg": msg}] {
                   input.review.kind.kind == "Deployment"
                   container := input.review.object.spec.template.spec.containers[_]
                   endswith(container.image, ":latest")
-                  msg := sprintf("container %q must use a pinned image tag instead of :latest", [container.name])
+                  msg := sprintf("%v/%v: container '%v' is using the latest tag for its image (%v), which is an anti-pattern.", [input.review.kind.kind, input.review.object.metadata.name, container.name, container.image])
                 }
-
-                violation[{"msg": msg}] {
-                  input.review.kind.kind == "Pod"
-                  container := input.review.object.spec.containers[_]
-                  endswith(container.image, ":latest")
-                  msg := sprintf("container %q must use a pinned image tag instead of :latest", [container.name])
-                }
+    # 2) Gatekeeper Constraint - where the rule applies and what to do
     - objectDefinition:
         apiVersion: constraints.gatekeeper.sh/v1beta1
-        kind: WsContainerTags
+        kind: ContainerImageLatest
         metadata:
-          name: ws-no-latest
+          name: containerimagelatest
         spec:
           enforcementAction: deny
           match:
             kinds:
-              - apiGroups: [""]
-                kinds: [Pod]
-              - apiGroups: [apps]
-                kinds: [Deployment]
+              - apiGroups: ["apps"]
+                kinds: ["Deployment"]
+    # 3) RHACM reporting - turns Gatekeeper admission denials into violations
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: policy-gatekeeper-admission-latest
+        spec:
+          remediationAction: inform
+          severity: low
+          object-templates:
+            - complianceType: mustnothave
+              objectDefinition:
+                apiVersion: v1
+                kind: Event
+                metadata:
+                  namespace: openshift-gatekeeper-system
+                  annotations:
+                    constraint_action: deny
+                    constraint_kind: ContainerImageLatest
+                    constraint_name: containerimagelatest
+                    event_type: violation
 ---
 apiVersion: policy.open-cluster-management.io/v1
 kind: PlacementBinding
 metadata:
-  name: ws-gatekeeper-container-tags
-  namespace: ws-gatekeeper-lab
+  name: binding-policy-gatekeeper-containerimage-latest
+  namespace: policy-gatekeeper
 placementRef:
-  name: ws-gatekeeper-container-tags
+  name: placement-policy-gatekeeper-containerimage-latest
   kind: Placement
   apiGroup: cluster.open-cluster-management.io
 subjects:
-  - name: ws-gatekeeper-container-tags
+  - name: policy-gatekeeper-containerimage-latest
     kind: Policy
     apiGroup: policy.open-cluster-management.io
 ---
 apiVersion: cluster.open-cluster-management.io/v1beta1
 kind: Placement
 metadata:
-  name: ws-gatekeeper-container-tags
-  namespace: ws-gatekeeper-lab
+  name: placement-policy-gatekeeper-containerimage-latest
+  namespace: policy-gatekeeper
 spec:
   clusterSets:
     - default
   predicates:
     - requiredClusterSelector:
         labelSelector:
-          matchLabels:
-            workshop.rhacm.io/gatekeeper-target: "true"
-YAML
+          matchExpressions:
+            - key: CHANGE_ME          # TODO: the cluster label key
+              operator: In
+              values: [CHANGE_ME]     # TODO: the two environments to target
+EOF
 
-echo "✅ Lab prepared. Generated policies: $LAB_DIR"
-echo "Next: inspect and apply install-gatekeeper.yaml from the lab guide."
+# Application manifests (Namespace + Deployment + Service + Route)
+app_manifest() {   # $1 namespace  $2 app name  $3 image tag
+  cat <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $1
+  labels:
+    ${LAB_LABEL_KEY}: ${LAB_LABEL_VALUE}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $2
+  namespace: $1
+  labels:
+    app: $2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: $2
+  template:
+    metadata:
+      labels:
+        app: $2
+    spec:
+      containers:
+        - name: $2
+          image: ${APP_IMAGE}:$3
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: $2
+  namespace: $1
+spec:
+  selector:
+    app: $2
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: $2
+  namespace: $1
+spec:
+  to:
+    kind: Service
+    name: $2
+  port:
+    targetPort: 8080
+EOF
+}
+app_manifest app-stage stage-hello latest >"$WORK_DIR/stage-hello.yaml"
+app_manifest app-test  hello-app   latest >"$WORK_DIR/hello-app.yaml"
+app_manifest app-prod  prod-hello  latest >"$WORK_DIR/prod-hello.yaml"
+
+echo ""
+echo "✅ [LAB READY] Environment successfully primed!"
+echo ""
+echo "   🟡 Stage cluster      : ${STAGE_CLUSTER}   (environment=stage)"
+echo "   🔴 Production cluster : ${PROD_CLUSTER}   (environment=production)"
+echo "   📦 Operator catalog   : ${CATALOG_SOURCE}"
+echo "   📁 Lab files          : ${WORK_DIR}"
+echo ""
+echo "👉 Next:  source ${WORK_DIR}/env.sh"
