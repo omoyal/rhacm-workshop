@@ -35,7 +35,7 @@
 2. Make sure that `oc` is logged in to your **ACM hub**:
 
    ```bash
-   oc whoami
+   oc whoami --show-server
    ```
 
    If you get an error, log in again: in the hub web console, open the user menu (top right) ➔ **Copy login command** ➔ **Display Token**, and run the `oc login --token=...` command in the Bastion terminal.
