@@ -87,7 +87,8 @@ info "Hub default StorageClass: ${DEFAULT_SC}"
 # --- OpenShift Data Foundation: Multicloud Object Gateway on the hub ------------
 noobaa_ready() { [[ "$(hub get noobaa noobaa -n "$ODF_NS" -o jsonpath='{.status.phase}' 2>/dev/null)" == "Ready" ]]; }
 sc_ready()     { hub get storageclass openshift-storage.noobaa.io >/dev/null 2>&1; }
-cluster_ready(){ [[ "$(hub get storagecluster ocs-storagecluster -n "$ODF_NS" -o jsonpath='{.status.phase}' 2>/dev/null)" == "Ready" ]]; }
+cluster_ready(){ hub get storagecluster -n "$ODF_NS" -o jsonpath='{range .items[*]}{.status.phase}{"\n"}{end}' 2>/dev/null | grep -x 'Ready' >/dev/null; }
+storageclusters() { hub get storagecluster -n "$ODF_NS" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null; }
 odf_ready()    { noobaa_ready && sc_ready && cluster_ready; }
 csvs_ready() {
   local phases
@@ -144,13 +145,18 @@ EOF
     || die "OpenShift Data Foundation did not finish installing. Check Operators > Installed Operators in project '${ODF_NS}', then run this script again."
   wait_for 300 "Waiting for the StorageCluster API" hub get crd storageclusters.ocs.openshift.io \
     || die "The StorageCluster API is not available."
-  if ! hub get storagecluster ocs-storagecluster -n "$ODF_NS" >/dev/null 2>&1; then
+  existing="$(storageclusters)"
+  if [[ -n "$existing" ]]; then
+    info "Using the existing OpenShift Data Foundation StorageCluster: ${existing}"
+  else
     hub apply -f - >/dev/null <<EOF || die "Cannot create the Multicloud Object Gateway StorageCluster."
 apiVersion: ocs.openshift.io/v1
 kind: StorageCluster
 metadata:
   name: ocs-storagecluster
   namespace: ${ODF_NS}
+  labels:
+    workshop.rhacm.io/lab: observability
 spec:
   multiCloudGateway:
     dbStorageClassName: ${DEFAULT_SC}
